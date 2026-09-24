@@ -1,0 +1,57 @@
+# ============================================================
+#  进仓库的只有：源码 + 依赖定义 + 文档
+#    源码      *.py / start.bat
+#    依赖定义  pyproject.toml / uv.lock   ← 「依赖相关的文件」指这两个
+#    文档      README.md / handover/
+#  其余一律不上传。依赖本体（.venv/）由 `uv sync` 重新下载，不进仓库。
+# ============================================================
+
+# ---------- 登录态：最要命的一类，绝不能传 ----------
+# .browser_profile/ 是 Playwright/Chromium 的 user_data_dir（约 270 MB），
+# 里面装着**你飞书账号的真实登录态** —— cookie、会话、缓存在这儿。
+# 传上去等于把账号交出去。运行时自动创建，删了重登一次就回来。
+.browser_profile/
+# 程序另存的一份 cookie 副本
+.feishu_session.json
+
+# ---------- 私人配置与运行产物 ----------
+# config.json 里是你的文档链接，password 字段还可能存着**文档访问密码**
+config.json
+handover/
+manifest.json
+links.txt
+downloads/
+logs/
+run.log
+
+# ---------- 探查残留（probe_export.py 跑出来的，随时能再生）----------
+_probe_js/
+_probe_out/
+_probe_*
+_试一下/
+.tmp-*
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+*.bak
+.DS_Store
+Thumbs.db
+desktop.ini
