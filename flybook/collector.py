@@ -20,7 +20,7 @@ import asyncio
 import re
 from urllib.parse import urljoin
 
-from .api import ApiError, dig
+from .api import ApiError, dig, token_of
 
 NODE_RE = re.compile(r"(/wiki/[A-Za-z0-9]+|/docx/[A-Za-z0-9]+)")
 
@@ -249,7 +249,7 @@ class LinkCollector:
         """
         self.log.log("开始抓取子文档链接…")
         out, seen = [], set()
-        root_tok = root_url.rstrip("/").rsplit("/", 1)[-1]
+        root_tok = token_of(root_url)
 
         # 1) 网络文档树（最可靠）
         if self.tree_nodes:

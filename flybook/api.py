@@ -34,6 +34,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # job_status：实测 2=处理中、0=成功；1=失败（沿用飞书开放平台的语义）
 JOB_DONE, JOB_FAILED, JOB_RUNNING = 0, 1, 2
 
+# 飞书业务错误码。这两个长得很像、含义完全不同，别混：
+#   PermFail        —— 「你是谁」不够格：身份是匿名读者，列不出文档树
+#   SourceNotExist  —— 「你要的东西」不存在：token 本身不对
+# 上层靠这个区分「该重登」还是「该改链接」。
+ERR_PERM_FAIL = 920004004
+ERR_SOURCE_NOT_EXIST = 920004002
+
 
 class ApiError(RuntimeError):
     """接口层错误。带业务 code 和响应片段，方便排查。"""
@@ -52,6 +59,26 @@ def dig(obj, *keys):
             return None
         cur = cur.get(k)
     return cur
+
+
+def token_of(url):
+    """从文档链接里取出 node token（路径的最后一段）。
+
+    ⚠️ 必须**剥掉 `?query` 和 `#fragment`**。飞书里点「复制链接」拿到的地址
+    通常长这样：
+
+        https://xxx.feishu.cn/wiki/AbCdEfGhIjKlMnOpQrSt?from=from_copylink
+                                               └── 查询串 ──┘
+
+    早期各处在用的是 `url.rstrip("/").rsplit("/", 1)[-1]` —— 只切斜杠、不剥查询串，
+    于是 token 变成了 `AbCdEfGhIjKlMnOpQrSt?from=from_copylink`。
+    服务端回 [920004002] SourceNotExist，看着像文档不存在或没权限，
+    其实只是 token 里混进了一串参数。而当时上层又把它当成「没登录」，
+    于是把人打发去 --reset 重登 —— 重登一百次也没用。
+
+    全项目只此一处实现，别再各写各的（曾经 5 处各写各的，就是这么漏的）。
+    """
+    return urllib.parse.urlparse(str(url or "")).path.rstrip("/").rsplit("/", 1)[-1]
 
 
 def sort_key_of(node):

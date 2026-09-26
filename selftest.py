@@ -141,10 +141,28 @@ with tempfile.TemporaryDirectory() as td:
     check("min_pdf_chars=0 时关闭文字校验", r["ok"] is True, r["reason"])
 
 print("== 6. API 层纯逻辑 ==")
-from flybook.api import ApiError, FeishuApi, dig  # noqa: E402
+from flybook.api import (  # noqa: E402
+    ERR_PERM_FAIL, ERR_SOURCE_NOT_EXIST, ApiError, FeishuApi, dig, token_of,
+)
 
 check("dig 按路径取值", dig({"a": {"b": {"c": 1}}}, "a", "b", "c") == 1)
 check("dig 中途断了返回 None", dig({"a": 1}, "a", "b") is None)
+
+# token_of：从链接里取 node token。曾经 5 处各写各的，全都只切斜杠不剥查询串，
+# 于是「复制链接」拿到的地址会带着 ?from=from_copylink 一起被当成 token，
+# 服务端回 [920004002] SourceNotExist，看着像文档不存在。
+TOK = "AbCdEfGhIjKlMnOpQrSt"
+check("普通链接", token_of(f"https://x.feishu.cn/wiki/{TOK}") == TOK)
+check(
+    "带 ?from= 的复制链接（就是踩过的那个坑）",
+    token_of(f"https://x.feishu.cn/wiki/{TOK}?from=from_copylink") == TOK,
+)
+check("带其他查询参数", token_of(f"https://x.feishu.cn/wiki/{TOK}?a=1&b=2") == TOK)
+check("带 #锚点", token_of(f"https://x.feishu.cn/wiki/{TOK}#heading") == TOK)
+check("带查询串和锚点", token_of(f"https://x.feishu.cn/wiki/{TOK}?a=1#h") == TOK)
+check("结尾多一条斜杠", token_of(f"https://x.feishu.cn/wiki/{TOK}/") == TOK)
+check("docx 链接也认", token_of(f"https://x.feishu.cn/docx/{TOK}") == TOK)
+check("空串不炸", token_of("") == "")
 
 api = FeishuApi("https://x.feishu.cn", "k=v", "CSRFVALUE")
 h = api._headers({"t": 1})
@@ -397,29 +415,45 @@ check(
 
 
 class _TreeApi:
-    """假接口：前 fail 次 get_tree 报 PermFail，之后放行。"""
+    """假接口：前 fail 次 get_tree 报错，之后放行。
 
-    def __init__(self, fail):
+    code 默认 PermFail（匿名读者那种「重试可能就好了」的错），用来验「会重试」。
+    报错文案照抄真实响应，形如 `[920004004] PermFail`。
+    """
+
+    LABELS = {ERR_PERM_FAIL: "PermFail", ERR_SOURCE_NOT_EXIST: "SourceNotExist"}
+
+    def __init__(self, fail, code=ERR_PERM_FAIL):
         self.left = fail
         self.calls = 0
+        self.code = code
 
     async def get_tree(self, tok):
         self.calls += 1
         if self.left > 0:
             self.left -= 1
-            raise ApiError("[920004004] PermFail")
+            raise ApiError(f"[{self.code}] {self.LABELS.get(self.code, 'Unknown')}",
+                           code=self.code)
         return {}, []
 
 
-ok, why = asyncio.run(S.verify(_TreeApi(2), "root", _Log(), tries=3, wait=0))
-check("凭证偶尔不过会重试到通过", ok is True and why == "")
+ok, why, code = asyncio.run(S.verify(_TreeApi(2), "root", _Log(), tries=3, wait=0))
+check("凭证偶尔不过会重试到通过", ok is True and why == "" and code is None)
 
 bad = _TreeApi(99)
-ok, why = asyncio.run(S.verify(bad, "root", _Log(), tries=3, wait=0))
-check("匿名会话（get_tree 一直被拒）过不了验收", ok is False and "PermFail" in why)
+ok, why, code = asyncio.run(S.verify(bad, "root", _Log(), tries=3, wait=0))
+check("匿名会话（get_tree 一直被拒）过不了验收",
+      ok is False and "PermFail" in why and code == ERR_PERM_FAIL)
 check("验收最多只试 tries 次", bad.calls == 3, f"试了 {bad.calls} 次")
 
-ok, why = asyncio.run(S.verify(_TreeApi(0), "", _Log(), tries=3, wait=0))
+# 节点不存在是**重试也没用**的错，不该白等三轮；而且上层要靠这个错误码区分
+# 「该重登」还是「该改链接」，带不出来就会把人打发去 --reset 白折腾一场。
+missing = _TreeApi(99, code=ERR_SOURCE_NOT_EXIST)
+ok, why, code = asyncio.run(S.verify(missing, "root", _Log(), tries=3, wait=0))
+check("SourceNotExist 不重试（重试也没用）", missing.calls == 1, f"试了 {missing.calls} 次")
+check("错误码带得出来供上层分流", code == ERR_SOURCE_NOT_EXIST, str(code))
+
+ok, why, code = asyncio.run(S.verify(_TreeApi(0), "", _Log(), tries=3, wait=0))
 check("拿不到根 token 时不瞎试", ok is False and "token" in why)
 
 ck, cs = S.join_cookies([

@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .api import ApiError, FeishuApi
+from .api import ERR_SOURCE_NOT_EXIST, ApiError, FeishuApi, token_of
 
 SESSION_FILE = ".feishu_session.json"
 
@@ -86,26 +86,47 @@ async def verify(api, root_token, logger, tries=VERIFY_TRIES, wait=VERIFY_WAIT):
     打开单篇（凭访问密码），但 get_tree 会被拒 [920004004] PermFail ——
     而列整棵树恰恰是这条流水线的必经之路。
 
-    返回 (True, "") 或 (False, 最后一次的失败原因)。
+    返回 (True, "", None) 或 (False, 最后一次的失败原因, 错误码)。
+    错误码要往上带：上层得靠它区分「该重登」还是「该改链接」，见 _diagnose。
     """
     if not root_token:
-        return False, "拿不到根文档 token"
-    last = ""
+        return False, "拿不到根文档 token", None
+    last, last_code = "", None
     for i in range(1, tries + 1):
         try:
             await api.get_tree(root_token)
-            return True, ""
+            return True, "", None
         except ApiError as e:
-            last = str(e)
+            last, last_code = str(e), e.code
+            # SourceNotExist = 这个节点根本不存在，再试多少次也还是不存在，
+            # 重试纯属白等（默认配置下要白等 3 次 × 3 秒）。最常见的原因是
+            # 链接里混进了 `?from=from_copylink`（见 api.token_of）。
+            if e.code == ERR_SOURCE_NOT_EXIST:
+                break
             if i < tries:
                 logger.log(f"  凭证验收未通过（第 {i}/{tries} 次）：{last}")
                 await asyncio.sleep(wait)
-    return False, last
+    return False, last, last_code
 
 
-def _diagnose(logger, reason):
-    """验收失败时把「下一步该干嘛」说清楚，别只丢一个 PermFail。"""
+def _diagnose(logger, reason, code=None):
+    """验收失败时把「下一步该干嘛」说清楚，别只丢一个错误码。
+
+    ⚠️ 得**按错误码分流**。以前不看错误码，一律当成「没登录」，于是链接写错的
+    人会被打发去 `--reset` 重登 —— 登完当然还是同一个错，白折腾一轮，
+    还以为是工具坏了。两个错误码的含义差着十万八千里：
+
+        PermFail        你是谁不够格（匿名读者列不出树）→ 该重登
+        SourceNotExist  你要的东西不存在（token 不对）  → 该改链接，跟登录无关
+    """
     logger.log(f"✗ 凭证验收没通过：{reason}")
+    if code == ERR_SOURCE_NOT_EXIST:
+        logger.log("  这是 [920004002] SourceNotExist —— **不是登录问题**，别去 --reset，")
+        logger.log("  重登多少次都是同一个错。它的意思是「这个节点不存在」。常见原因：")
+        logger.log("    1) 文档已被删除，或者链接复制得不完整（少了几位）。")
+        logger.log("    2) 这个节点不在当前租户下 —— 飞书对**无权访问**的节点也回「不存在」，")
+        logger.log("       所以也可能只是账号没权限。")
+        return
     logger.log("  这说明浏览器里的这个身份**列不出这个知识库的文档树**。常见原因：")
     logger.log("    1) 其实没登录 —— 知识库凭访问密码可以匿名看单篇，但列整棵树")
     logger.log("       要正式成员身份。请重跑下面这条命令，并在弹出的窗口里")
@@ -124,7 +145,7 @@ async def refresh(cfg, logger, profile_dir, cfg_path, root_url, headless=False):
     logger.log("正在启动浏览器获取登录凭证…")
     u = urlparse(root_url)
     host = f"{u.scheme}://{u.netloc}"
-    root_token = root_url.rstrip("/").rsplit("/", 1)[-1]
+    root_token = token_of(root_url)
 
     async with async_playwright() as p:
         session = BrowserSession(cfg, logger, profile_dir, cfg_path, headless=headless)
@@ -146,9 +167,9 @@ async def refresh(cfg, logger, profile_dir, cfg_path, root_url, headless=False):
                 timeout=cfg.get("api_timeout", 60),
             )
             # 验收放在浏览器还开着的时候做 —— 万一不过，人还在跟前，能直接重登。
-            ok, reason = await verify(api, root_token, logger)
+            ok, reason, code = await verify(api, root_token, logger)
             if not ok:
-                _diagnose(logger, reason)
+                _diagnose(logger, reason, code)
                 return None
             logger.log(
                 f"凭证已取到并验收通过"

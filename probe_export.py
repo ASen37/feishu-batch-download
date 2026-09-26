@@ -22,14 +22,10 @@ sys.path.insert(0, str(BASE))
 
 from flybook import config as C  # noqa: E402
 from flybook import session as S  # noqa: E402
-from flybook.api import ApiError, FeishuApi  # noqa: E402
+from flybook.api import ApiError, FeishuApi, token_of  # noqa: E402
 
 CONFIG_PATH = BASE / "config.json"
 SESSION_PATH = BASE / S.SESSION_FILE
-
-
-def token_of(url):
-    return url.rstrip("/").rsplit("/", 1)[-1]
 
 
 async def submit(api, label, payload):

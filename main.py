@@ -40,7 +40,7 @@ from urllib.parse import urlparse
 
 from flybook import config as config_mod
 from flybook import session as session_mod
-from flybook.api import ApiError, FeishuApi
+from flybook.api import ApiError, FeishuApi, token_of
 from flybook.browser import BrowserSession
 from flybook.collector import LinkCollector, build_paths, load_links_file, probe_via_api
 from flybook.exporter import Exporter
@@ -62,11 +62,6 @@ PROFILE_DIR = BASE_DIR / ".browser_profile"
 SESSION_PATH = BASE_DIR / session_mod.SESSION_FILE
 
 MARKS = {"ok": "✓", "skip": "→", "fail": "✗"}
-
-
-def token_of(url):
-    """从文档链接里取出 node token(最后一段路径)。"""
-    return url.rstrip("/").rsplit("/", 1)[-1]
 
 
 def fmt_label(cfg):
@@ -103,8 +98,7 @@ async def collect_via_browser(cfg, logger, headless, root_url, host):
                 return [], ""
             await collector.wait_for_tree()
             nodes = await collector.collect(page, root_url, host)
-            root_tok = root_url.rstrip("/").rsplit("/", 1)[-1]
-            return nodes, collector.node_titles.get(root_tok, "")
+            return nodes, collector.node_titles.get(token_of(root_url), "")
         finally:
             await session.close()
 
