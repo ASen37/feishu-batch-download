@@ -715,6 +715,203 @@ check("PDF 仍旧用 PDF 门槛", e3._min_bytes() == pdfcfg["min_pdf_bytes"] == 
 check("老配置里没有 min_text_bytes 时补默认值",
       C.coerce({"root_url": "https://x/y"})["min_text_bytes"] == 16)
 
+print("== 18. 全局请求节流（429 之后要全体慢下来） ==")
+import time  # noqa: E402
+
+from flybook.throttle import Throttle  # noqa: E402
+
+check("新配置键都补上了默认值",
+      cfg["api_min_interval"] == 0.25 and cfg["api_max_interval"] == 4.0
+      and cfg["retry_429_backoff"] == 8.0 and cfg["mindmap_to_image"] is True)
+bad_th = C.coerce({"api_min_interval": "快一点"})
+check("坏值回落默认", bad_th["api_min_interval"] == 0.25)
+
+
+def _throttle_checks():
+    th = Throttle(min_interval=0.05, max_interval=0.4, recovery=3, recover_ratio=0.5)
+
+    async def _burst(n):
+        for _ in range(n):
+            await th.acquire()
+
+    t0 = time.monotonic()
+    asyncio.run(_burst(4))
+    spent = time.monotonic() - t0
+    check("acquire 按最小间隔排队（4 次要等 3 个间隔）", spent >= 0.15,
+          f"用了 {spent:.3f}s")
+    check("没被限流时间隔保持基准值", abs(th.interval - 0.05) < 1e-9, str(th.interval))
+
+    asyncio.run(th.penalize())
+    check("429 后间隔翻倍", abs(th.interval - 0.1) < 1e-9, str(th.interval))
+    t0 = time.monotonic()
+    asyncio.run(_burst(1))
+    cooldown = time.monotonic() - t0
+    check("429 后所有 worker 一起等（全局冷却，不是各等各的）", cooldown >= 0.3,
+          f"等了 {cooldown:.3f}s")
+
+    async def _many_penalties():
+        for _ in range(6):
+            await th.penalize()
+
+    asyncio.run(_many_penalties())
+    check("间隔有上限，撞多少次也不会无限拉长",
+          abs(th.interval - th.max_interval) < 1e-9, str(th.interval))
+
+    async def _many_rewards(n):
+        for _ in range(n):
+            await th.reward()
+
+    asyncio.run(_many_rewards(3))
+    check("连续成功够次数后往回缩", th.interval < th.max_interval, str(th.interval))
+    asyncio.run(_many_rewards(60))
+    check("缩到基准值就停，不会比基准还小",
+          abs(th.interval - 0.05) < 1e-9, str(th.interval))
+    check("429 次数被记下来（汇总要报）", th.penalties == 7, str(th.penalties))
+
+
+_throttle_checks()
+
+print("== 19. 空壳 Markdown 判定（整篇是思维导图的文档） ==")
+from flybook.exporter import (  # noqa: E402
+    blank_md, extract_pdf_images, read_pdf_images,
+)
+
+
+def _w(tmp, text):
+    p = Path(tmp) / "x.md"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    # 实测飞书给思维导图文档导出的产物就是这两种，
+    # 一字不差地拿来当夹具，别再凭想象编
+    b, t = blank_md(_w(tmp, "# 总结\n\n"))
+    check("实测空壳（第5章总结）判为空", b is True and t == "总结", f"{b} {t!r}")
+    b, t = blank_md(_w(tmp, "# 总结\n\n\n\n"))
+    check("多换行也是空壳", b is True and t == "总结", f"{b} {t!r}")
+    b, _t = blank_md(_w(tmp, "# 第1章\\-Java基础\n\n正文\n"))
+    check("有正文就不算空壳", b is False)
+    b, t = blank_md(_w(tmp, "# 第1章\\-Java基础\n\n"))
+    check("标题里的转义反斜杠要还原", t == "第1章-Java基础", repr(t))
+    b, t = blank_md(_w(tmp, ""))
+    check("完全没有标题的空文件也算空", b is True and t == "")
+    b, _t = blank_md(_w(tmp, "正文没有标题\n"))
+    check("没有标题但有正文 → 不是空壳", b is False)
+
+print("== 20. 从 PDF 里抠图片（思维导图兜底靠它） ==")
+
+
+def _mini_pdf(pages, content=b""):
+    """手搓一个最小 PDF 用来离线验抠图。
+
+    pages 是 [[(名字, 图片字节), ...], ...]，一个元素一页。
+    图片按**内容**去重成同一个 XObject —— 飞书就是这么干的（同一张导图
+    在每一页各挂一次），所以夹具必须复现这一点，否则测不出重复。
+
+    content 是往每页内容流里塞的字节，用来模拟「矢量画的画板」。
+    """
+    uniq, order = {}, []
+    for imgs in pages:
+        for name, data in imgs:
+            if data not in uniq:
+                uniq[data] = name
+                order.append(data)
+    img_ids = {d: 3 + i for i, d in enumerate(order)}
+    nxt = 3 + len(order)
+    page_ids, cont_ids = [], []
+    for _ in pages:
+        page_ids.append(nxt)
+        cont_ids.append(nxt + 1)
+        nxt += 2
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: ("<< /Type /Pages /Kids [%s] /Count %d >>"
+            % (" ".join(f"{p} 0 R" for p in page_ids), len(page_ids))).encode(),
+    }
+    for data in order:
+        objs[img_ids[data]] = (
+            b"<< /Type /XObject /Subtype /Image /Width 2 /Height 2 "
+            b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode "
+            b"/Length " + str(len(data)).encode() + b" >>\nstream\n"
+            + data + b"\nendstream")
+    for k, imgs in enumerate(pages):
+        xo = " ".join(f"/I{j} {img_ids[d]} 0 R" for j, (_n, d) in enumerate(imgs))
+        objs[page_ids[k]] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] "
+            f"/Resources << /XObject << {xo} >> >> /Contents {cont_ids[k]} 0 R >>"
+        ).encode()
+        objs[cont_ids[k]] = (b"<< /Length " + str(len(content)).encode()
+                             + b" >>\nstream\n" + content + b"\nendstream")
+
+    buf = bytearray(b"%PDF-1.4\n")
+    offsets = {}
+    for i in sorted(objs):
+        offsets[i] = len(buf)
+        buf += f"{i} 0 obj\n".encode() + objs[i] + b"\nendobj\n"
+    top = max(objs) + 1
+    xref_at = len(buf)
+    buf += f"xref\n0 {top}\n".encode() + b"0000000000 65535 f \n"
+    for i in range(1, top):
+        buf += f"{offsets.get(i, 0):010d} 00000 n \n".encode()
+    buf += (f"trailer\n<< /Size {top} /Root 1 0 R >>\nstartxref\n{xref_at}\n"
+            f"%%EOF\n").encode()
+    return bytes(buf)
+
+
+# 两个假 JPEG：只要文件头对得上就行 —— 抠图那一步是**原样搬字节**，
+# 不会去解码，所以夹具不必是真能显示的图。这里测的是「认不认得出来、
+# 有没有漏、有没有重复」，不是解码器。
+JPEG_A = b"\xff\xd8\xff\xe0" + b"A" * 60 + b"\xff\xd9"
+JPEG_B = b"\xff\xd8\xff\xe0" + b"B" * 60 + b"\xff\xd9"
+
+with tempfile.TemporaryDirectory() as tmp:
+    from pypdf import PdfReader
+
+    # 飞书的真实形态：同一张图挂在两页上
+    p = Path(tmp) / "same.pdf"
+    p.write_bytes(_mini_pdf([[(("a", JPEG_A))], [(("a", JPEG_A))]]))
+    total, imgs, _ink = read_pdf_images(p)
+    check("同一张图挂多页只算一张（去重）",
+          len(imgs) == 1 and imgs[0] == ("jpg", JPEG_A), f"{total} 张 / 抠出 {len(imgs)}")
+
+    # 两页各挂各的图
+    p2 = Path(tmp) / "two.pdf"
+    p2.write_bytes(_mini_pdf([[("a", JPEG_A)], [("b", JPEG_B)]]))
+    total, imgs, _ink = read_pdf_images(p2)
+    check("两页两张图都抠到且保序",
+          [d for _e, d in imgs] == [JPEG_A, JPEG_B], f"{total} 张")
+    check("DCTDecode 原样搬字节，不重编码",
+          imgs[0][0] == "jpg" and imgs[0][1] == JPEG_A)
+
+    # 实测的残缺渲染：内容流 860 字节（一个白底 + 一行标题），没有任何位图。
+    # 注意这**不能**推出「这篇是空的」—— 同一篇文档换个时候导就是 16 KB。
+    p3 = Path(tmp) / "none.pdf"
+    empty_content = b"0 0 720 1048 re f\n" * 43
+    p3.write_bytes(_mini_pdf([[]], content=empty_content))
+    total, imgs, ink = read_pdf_images(p3)
+    check("没有图的 PDF 报 0 张，能跟「解析失败」区分",
+          total == 0 and imgs == [], f"{total} {imgs}")
+    check("内容流量得出来（判「这版画了多少东西」就靠它）",
+          ink == len(empty_content), f"{ink} vs {len(empty_content)}")
+
+    # 矢量画的画板：一样没有位图，内容流明显更大 —— 靠这个挑出最全的那版
+    p5 = Path(tmp) / "vector.pdf"
+    rich_content = b"1 0 0 RG 10 10 m 90 90 l S\n" * 200
+    p5.write_bytes(_mini_pdf([[]], content=rich_content))
+    total, imgs, ink_rich = read_pdf_images(p5)
+    check("矢量画板：同样抠不出图，但内容流更大",
+          total == 0 and imgs == [] and ink_rich > ink, f"{ink_rich} > {ink}")
+    check("多导几轮时挑内容流最大的那版（内容流就是排序依据）",
+          max(ink, ink_rich) == ink_rich)
+
+    p4 = Path(tmp) / "broken.pdf"
+    p4.write_bytes(b"%PDF-1.4\nnot a real pdf at all\n")
+    total, _imgs, ink = read_pdf_images(p4)
+    check("解析不了时报 None，绝不冒充「这篇是空文档」", total is None, str(total))
+    check("解析不了时内容流按 0 报", ink == 0, str(ink))
+
 print()
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项。")
 for n in FAIL:

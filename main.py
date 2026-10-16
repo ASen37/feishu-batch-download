@@ -46,6 +46,7 @@ from flybook.collector import LinkCollector, build_paths, load_links_file, probe
 from flybook.exporter import Exporter
 from flybook.logger import Logger
 from flybook.manifest import Manifest, safe_name
+from flybook.throttle import Throttle
 
 # Windows 终端编码容错:特殊字符无法编码时用 ? 代替,避免崩溃
 try:
@@ -116,10 +117,17 @@ async def run(cfg, args, logger):
     stats = {"ok": 0, "skip": 0, "fail": 0}
     failed = []
 
+    # 全进程共用一把节流器：换成每个客户端各限各的，等于没限。
+    throttle = Throttle(
+        min_interval=cfg["api_min_interval"],
+        max_interval=cfg["api_max_interval"],
+    )
+
     def make_api(data):
         return FeishuApi(
             host, data["cookie"], data.get("csrf", ""),
             referer=cfg["root_url"], timeout=cfg["api_timeout"],
+            throttle=throttle,
         )
 
     async def refresh_api():
@@ -272,6 +280,13 @@ async def run(cfg, args, logger):
 
     logger.log("===== 汇总 =====")
     logger.log(f"成功 {stats['ok']} 个,跳过 {stats['skip']} 个,失败 {stats['fail']} 个。")
+    if exporter.mindmaps:
+        logger.log(f"其中思维导图转图片 {exporter.mindmaps} 篇"
+                   f"（Markdown 导不出画板内容，改导 PDF 抠的图）。")
+    if throttle.penalties:
+        # 只在真被限流过时才提，正常跑不该刷这一行
+        logger.log(f"接口限流：{throttle.describe()}，"
+                   f"排队等待 {throttle.waits} 次。")
     for tok, detail in failed:
         logger.log(f"  失败: {tok} —— {detail}")
     if failed:

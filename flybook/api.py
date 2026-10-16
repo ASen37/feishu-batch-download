@@ -14,6 +14,9 @@
   3. GET  box/stream/download 下载成品
 注意 node_token 不能直接导出（服务端返回 code 1014 "export file token
 not found"），必须先用 get_node 换成文档本体的 obj_token。
+
+所有请求都要过 `throttle.Throttle` 排队。理由见 throttle.py：429 是
+**累计配额**打满，光靠 worker 各自重试没用，必须全体一起停。
 """
 
 import asyncio
@@ -24,6 +27,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+from .throttle import Throttle
 
 # 下载走的是另一个域名，和文档域不同
 STREAM_HOST = "https://internal-api-drive-stream.feishu.cn"
@@ -40,6 +45,16 @@ JOB_DONE, JOB_FAILED, JOB_RUNNING = 0, 1, 2
 # 上层靠这个区分「该重登」还是「该改链接」。
 ERR_PERM_FAIL = 920004004
 ERR_SOURCE_NOT_EXIST = 920004002
+
+# HTTP 429「Too Many Requests」在这里被单独拎出来当业务码用。
+# 上层靠它区分「等一会儿还能成」和「这篇本身有问题」—— 前者要拉长退避、
+# 让全体 worker 一起停（见 throttle），后者重试多少次都一样。
+ERR_RATE_LIMITED = 429
+
+
+def is_rate_limited(exc):
+    """这个异常是不是被限流了？导出器按它决定退避策略。"""
+    return isinstance(exc, ApiError) and exc.code == ERR_RATE_LIMITED
 
 
 class ApiError(RuntimeError):
@@ -97,12 +112,15 @@ def sort_key_of(node):
 class FeishuApi:
     """一个租户域 + 一份凭证 = 一个客户端。线程安全（无共享可变状态）。"""
 
-    def __init__(self, host, cookie, csrf="", referer="", timeout=60):
+    def __init__(self, host, cookie, csrf="", referer="", timeout=60, throttle=None):
         self.host = host.rstrip("/")
         self.cookie = cookie
         self.csrf = csrf
         self.referer = referer or f"{self.host}/"
         self.timeout = timeout
+        # 不传就自建一个：这样老调用方（selftest、probe_*.py）不用改。
+        # 要紧的是 main.py **传同一个进来**，否则每个客户端各限各的，等于没限。
+        self.throttle = throttle if throttle is not None else Throttle()
 
     # ---------------- 底层 ----------------
 
@@ -149,13 +167,27 @@ class FeishuApi:
         url = f"{STREAM_HOST}/space/api/box/stream/download/all/{file_token}/"
         req = urllib.request.Request(url, headers=self._headers())
         dst = Path(dst)
-        with urllib.request.urlopen(req, timeout=max(self.timeout, 180)) as resp:
-            enc = resp.headers.get("Content-Encoding", "")
-            if "gzip" in enc:
-                dst.write_bytes(gzip.decompress(resp.read()))
-            else:
-                with open(dst, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 180)) as resp:
+                enc = resp.headers.get("Content-Encoding", "")
+                if "gzip" in enc:
+                    dst.write_bytes(gzip.decompress(resp.read()))
+                else:
+                    with open(dst, "wb") as f:
+                        shutil.copyfileobj(resp, f)
+        except urllib.error.HTTPError as e:
+            # 下载域名也会限流，同样得让上层认得出是 429。
+            # （这里以前不接 HTTPError，于是下载失败会漏成原始 urllib 异常，
+            # 日志里显示成「HTTP Error 429: Too Many Requests」，跟接口层的
+            # 「HTTP 429」不是一个长相，靠字符串去认很脆。）
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            raise ApiError(f"HTTP {e.code}", code=e.code, body=detail) from e
+        except urllib.error.URLError as e:
+            raise ApiError(f"网络错误：{e.reason}") from e
         return dst.stat().st_size
 
     @staticmethod
@@ -171,7 +203,21 @@ class FeishuApi:
         return body.get("data") or {}
 
     async def _call(self, url, method="GET", payload=None):
-        return await asyncio.to_thread(self._request, url, method, payload)
+        """走限流的一次调用。
+
+        节流放在**这一层**（async）而不是 `_request`（线程里）：`acquire` 是
+        协程，而 `_request` 跑在 `to_thread` 的工作线程里，那儿没有事件循环。
+        奖励/惩罚也在这一层做，把「429 要全体减速」这件事收在一个地方。
+        """
+        await self.throttle.acquire()
+        try:
+            body = await asyncio.to_thread(self._request, url, method, payload)
+        except ApiError as e:
+            if e.code == ERR_RATE_LIMITED:
+                await self.throttle.penalize()
+            raise
+        await self.throttle.reward()
+        return body
 
     # ---------------- 文档树 ----------------
 
@@ -312,4 +358,12 @@ class FeishuApi:
         raise ApiError(f"导出超时（{timeout:.0f} 秒仍在处理中）")
 
     async def download(self, file_token, dst):
-        return await asyncio.to_thread(self._download_sync, file_token, dst)
+        await self.throttle.acquire()
+        try:
+            size = await asyncio.to_thread(self._download_sync, file_token, dst)
+        except ApiError as e:
+            if e.code == ERR_RATE_LIMITED:
+                await self.throttle.penalize()
+            raise
+        await self.throttle.reward()
+        return size

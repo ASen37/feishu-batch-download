@@ -269,7 +269,20 @@ class Manifest:
         except Exception:
             return Path(path).name
 
-    def record_ok(self, token, title, path, pages, chars, opts=""):
+    def record_ok(self, token, title, path, pages, chars, opts="", kind="doc",
+                  images=0):
+        """记一条成功。
+
+        kind 说明这份产物是**怎么来的**：
+          - `doc`     ：飞书导出的正文（PDF / Word / Markdown 原样）
+          - `mindmap` ：整篇就是一张思维导图，正文导出来是空壳，
+                        改走「导 PDF 抠图」兜底（见 exporter），
+                        images 记抠到几张
+
+        为什么要记：老清单里有一批空壳 md 被记成了 ok（那时还没兜底），
+        `is_done` 会把它们一路放行，于是修好了也永远不重导。有了 kind，
+        才有一根「这篇是按新规则导的」的凭据。
+        """
         path = Path(path)
         try:
             size, digest = path.stat().st_size, sha1_of(path)
@@ -280,6 +293,8 @@ class Manifest:
             "file": self._rel(path),
             # 导出选项签名：换格式或换评论/附件选项时靠它发现「这份是旧的」
             "opts": opts,
+            "kind": kind,
+            "images": images,
             "size": size,
             "sha1": digest,
             "pages": pages,

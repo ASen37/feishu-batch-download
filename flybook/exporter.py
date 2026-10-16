@@ -14,18 +14,37 @@
 """
 
 import asyncio
+import hashlib
 import logging
 import re
 import shutil
 import stat
+import struct
 import zipfile
+import zlib
 from pathlib import Path
 
+from .api import is_rate_limited
 from .config import ext_of
 from .manifest import opts_sig
 
 # 日志里说人话用的格式名（`docx` 说成 Word，省得看日志的人愣一下）
 EXT_LABEL = {"pdf": "PDF", "docx": "Word", "md": "Markdown"}
+
+# 兜底时最多导几份 PDF，留内容最全的那版。
+#
+# 第一份就给到位图的话只导一次 —— 思维导图都是这样，占绝大多数。
+# 抠不到位图才会多导，因为**同一篇文档服务端的渲染会时好时坏**：实测
+# 「接口文档」这篇连着导三次，内容流分别是 860 / 5900 / 16322 字节，
+# 只有最后一版是画全了的。860 那版跟「真空文档」长得一模一样 ——
+# 所以不能用任何门槛去判「这篇没内容」，只能多导几次挑最大的。
+_PDF_ROUNDS = 3
+
+# 「字数少得可疑」的 Markdown 门槛，用来捞出清单里那批老的空壳记录。
+# 空壳实测是 10~12 字节（`# 总结\n\n`）；飞书给的标题本身就是几个字，
+# 所以数的是 md 里的字符数（`# 总结` 算 3 个字），门槛取 32 足够宽松 ——
+# 它只影响「要不要重查一次」，不会误判产物好坏，宽一点无所谓。
+SUSPECT_MD_CHARS = 32
 
 try:
     from pypdf import PdfReader
@@ -68,6 +87,122 @@ def count_images(reader, limit=50):
         except Exception:
             continue
     return n
+
+
+def _pdf_colors(obj):
+    """这个图片 XObject 有几个颜色分量。认不出来返回 0。"""
+    cs = obj.get("/ColorSpace")
+    try:
+        if hasattr(cs, "get_object"):
+            cs = cs.get_object()
+    except Exception:
+        return 0
+    if isinstance(cs, list) and cs:
+        head = cs[0]
+        # ICCBased 的分量数写在它自己的流字典 /N 上
+        if str(head) == "/ICCBased" and len(cs) > 1:
+            try:
+                prof = cs[1].get_object()
+                return int(prof.get("/N") or 0)
+            except Exception:
+                return 0
+        cs = head
+    return {"/DeviceGray": 1, "/DeviceRGB": 3, "/DeviceCMYK": 4}.get(str(cs), 0)
+
+
+def _png_bytes(raw, width, height, colors):
+    """把解压好的裸位图拼成 PNG（8 位/通道）。
+
+    只在 FlateDecode 那档用得上 —— 飞书给画板渲染的图基本都是 JPEG，
+    但万一换成 PNG 压缩，不认就会把它当成「这篇是空文档」，那是静默丢内容。
+    """
+    if colors not in (1, 3, 4) or width <= 0 or height <= 0:
+        return None
+    stride = width * colors
+    if len(raw) < stride * height:
+        return None
+    # PNG 每个扫描行前面要加一个「滤波方式」字节，0 = 不过滤
+    scanlines = b"".join(
+        b"\x00" + raw[y * stride:(y + 1) * stride] for y in range(height)
+    )
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8,
+                       {1: 0, 3: 2, 4: 6}[colors], 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(scanlines, 6)) + chunk(b"IEND", b""))
+
+
+def extract_pdf_images(reader):
+    """把 PDF 里嵌的图片原样抠出来，返回 [(扩展名, 字节), ...]（保序、按内容去重）。
+
+    **为什么直接搬字节、不重编码**：飞书给思维导图/画板渲染的是 DCTDecode
+    流 —— 就是一张现成的 JPEG（实测 2560×2560）。它本来就是服务端渲染好的
+    成品图，再过一道编解码只会掉画质、还慢。所以 DCTDecode 原样写 `.jpg`。
+
+    去重是必须的：同一张导图会在 PDF 的每一页各挂一次（实测 2 页都挂着
+    同一个 XObject），不去重就会把同一张图存两遍。
+
+    抠不到返回空表 —— 调用方据此判断「这篇是真的空文档」。
+    """
+    out, seen = [], set()
+    for pg in reader.pages:
+        try:
+            res = pg.get("/Resources")
+            if hasattr(res, "get_object"):
+                res = res.get_object()
+            xobj = res.get("/XObject") if res else None
+            if hasattr(xobj, "get_object"):
+                xobj = xobj.get_object()
+            items = list(xobj.items()) if xobj else []
+        except Exception:
+            continue
+        for _name, ref in items:
+            try:
+                obj = ref.get_object()
+            except Exception:
+                continue
+            try:
+                if obj.get("/Subtype") != "/Image":
+                    continue
+            except Exception:
+                continue
+
+            filt = obj.get("/Filter")
+            if isinstance(filt, list):
+                filt = filt[-1] if filt else None
+            filt = str(filt or "")
+            try:
+                if filt == "/DCTDecode":
+                    # 私有属性有点丑，但 pypdf 没有公开 API 拿「未解码的流」，
+                    # 而 get_data() 对 DCTDecode 的行为不值得赌（有的版本会
+                    # 试图解码、有的原样返回）。这里要的就是原始字节。
+                    data = bytes(obj._data)
+                    ext = "jpg"
+                elif filt == "/FlateDecode":
+                    data = _png_bytes(
+                        obj.get_data(),
+                        int(obj.get("/Width") or 0),
+                        int(obj.get("/Height") or 0),
+                        _pdf_colors(obj),
+                    )
+                    if data is None:
+                        continue
+                    ext = "png"
+                else:
+                    continue
+            except Exception:
+                continue
+
+            key = hashlib.sha1(data).hexdigest()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((ext, data))
+    return out
 
 
 def inspect_pdf(path, min_chars=0, min_bytes=3072):
@@ -189,6 +324,83 @@ def inspect_output(path, ext, min_chars=0, min_bytes=3072):
     return info
 
 
+_RE_H1 = re.compile(r"^\s*#\s+(.*)$")
+
+
+def blank_md(path):
+    """这份 Markdown 是不是「空壳」？返回 (是否空壳, 从里面读到的标题)。
+
+    什么叫空壳：剥掉开头那行 H1 标题之后，一个字都不剩。
+
+    这个判断专治**思维导图 / 画板文档**。实测这类文档导成 Markdown 时，
+    产物是 10 个字节的 `# 总结\\n\\n` —— 正文一个字没有，服务端也不报错。
+    早先它被当成「文件过小」判失败，于是每轮重跑都失败一遍，而真相是
+    **这个格式导不出它的内容**，重试一万次也一样，得换条路（见 _mindmap_retry）。
+
+    为什么不能只看体积：真正内容少的文档（比如知识库根文档「首页」只有
+    467 字节）体积也很小，拿体积当信号会误伤。剥掉标题之后还剩不剩字，
+    才分得清「短」和「空」。
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False, ""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    title = ""
+    if i < len(lines):
+        m = _RE_H1.match(lines[i])
+        if m:
+            # 飞书把标题里的 `-` 之类转义成了 `\\-`，还原一下再当标题用
+            title = m.group(1).strip().replace("\\", "")
+            i += 1
+    return (not "\n".join(lines[i:]).strip()), title
+
+
+def pdf_ink_bytes(reader):
+    """把所有页面内容流的字节数加起来 —— 「这页到底画了东西没有」的粗略量。
+
+    为什么需要它：判「这篇是不是空文档」不能只看有没有位图。**矢量画的画板**
+    在 PDF 里一个图片对象都没有，但内容是真的。实测空的画板文档
+    （整页就是一个白色底 + 一行标题）内容流是 860 字节 —— 有指令，但没内容。
+
+    读不出来时返回一个超过门槛的值：**读不出来就当它有东西**。
+    这一头错了只是多留个文件，另一头错了是把内容丢掉。
+    """
+    total = 0
+    for pg in reader.pages:
+        try:
+            c = pg.get_contents()
+            if c is not None:
+                total += len(c.get_data())
+        except Exception:
+            return _VECTOR_INK_MIN
+    return total
+
+
+def read_pdf_images(path):
+    """读一个 PDF，返回 (图片总数, [(扩展名, 字节), ...], 内容流字节数)。
+
+    **总数和「抠出来的」要分开报**：总数 > 0 却一张都没抠出来，说明那是我们
+    不认识的图片流，这时绝不能反过来说「这篇文档是空的」—— 那等于把内容
+    丢了还报成功。
+
+    PDF 解析失败返回 (None, [], 0)，跟「真的没有图」(0, [], N) 区分开。
+    """
+    if PdfReader is None:
+        return None, [], 0
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        return None, [], 0
+    try:
+        return count_images(reader), extract_pdf_images(reader), pdf_ink_bytes(reader)
+    except Exception:
+        return None, [], 0
+
+
 def is_zip(path):
     """文件头是不是 ZIP（`PK`）。
 
@@ -278,19 +490,42 @@ class Exporter:
         # 没有附件的文档因此会多包一层只装一个 .md 的文件夹 —— 换来的是
         # 落点可预测、跳过判断可靠，这个交换划算。
         self.wrap = self.ext == "md" and self.attachment
+        # 思维导图/画板文档的兜底开关，只对 Markdown 档有意义（见 _mindmap_retry）
+        self.mindmap = bool(cfg.get("mindmap_to_image", True))
+        # 本次运行走了兜底的篇数，汇总时报给主人。worker 都在同一个事件循环里
+        # 跑，自增之间没有 await，不会丢计数。
+        self.mindmaps = 0
+
+    def _skip_ok(self, node_token, title, parents):
+        """这篇能不能直接跳过？"""
+        if not (self.manifest.is_done(node_token, self.cfg.get("skip_existing", True))
+                and self.manifest.is_current(
+                    node_token, parents, self.sig, self.cfg["max_filename_len"],
+                    wrap=self.wrap, title=title)):
+            return False
+        # Markdown 档还要多看一眼：清单里存着一批**空壳 md 被记成 ok** 的老记录
+        # （加导图兜底之前导的，正文只有一行标题）。它们文件在、大小也对，
+        # is_done 会一路放行，结果是「修好了也永远不重导」。
+        # 只挑「字数少得可疑、又没打 kind 标记」的重查一次，别的 md 记录不受影响。
+        if self.ext == "md":
+            rec = self.manifest.get(node_token) or {}
+            if not rec.get("kind") and (rec.get("chars") or 0) < SUSPECT_MD_CHARS:
+                return False
+            # 「空文档」那条结论已经删掉了 —— 它是错的（画板渲染时好时坏，
+            # 860 字节那版跟真空文档长得一模一样）。那批记录的字数被写成 0，
+            # 正好拿来认：正常的 md 记录字数一定 > 0（空文本压根过不了校验）。
+            if rec.get("kind") == "doc" and not rec.get("chars"):
+                return False
+        return True
 
     async def export(self, node_token, obj_token, title, parents=None):
         """导出单篇。返回 (status, detail)，status ∈ {ok, skip, fail}。
 
         parents 是祖先标题链，用来决定这篇落在哪个子目录（见 manifest.allocate_path）。
         """
-        skip = self.cfg.get("skip_existing", True)
         # 除了「下过没下过」，还得看「位置和选项对不对」：目录规则变了、或者
         # 换了格式/评论选项时，老文件还在老地方，只比 is_done 会把它们全放过。
-        if self.manifest.is_done(node_token, skip) and self.manifest.is_current(
-            node_token, parents, self.sig, self.cfg["max_filename_len"],
-            wrap=self.wrap, title=title,
-        ):
+        if self._skip_ok(node_token, title, parents):
             rec = self.manifest.get(node_token) or {}
             return "skip", rec.get("file", "")
 
@@ -299,9 +534,15 @@ class Exporter:
 
         attempts = max(1, self.cfg["max_retry"])
         backoff = self.cfg["retry_backoff"]
+        rate_backoff = float(self.cfg.get("retry_429_backoff", backoff))
         last_err = "未知错误"
+        # 限流时临时放宽的「这次最多试几次」。配额窗口以分钟计，
+        # 3 次 × 2 秒的老节奏等于没等（2026-10-16 就是这么整片失败的）。
+        limit = attempts
+        attempt = 0
 
-        for attempt in range(1, attempts + 1):
+        while attempt < limit:
+            attempt += 1
             try:
                 if not obj_token:
                     # 浏览器兜底路径抓到的节点只带 node_token，这里补换一次
@@ -312,15 +553,24 @@ class Exporter:
                 out, info = await self._once(obj_token, node_token, title, parents)
             except Exception as e:
                 last_err = str(e)
-                self.log.log(f"  第 {attempt}/{attempts} 次失败：{last_err}")
-                if attempt < attempts:
+                if is_rate_limited(e):
+                    # 429 不是这篇的问题，多给几次机会
+                    limit = max(limit, attempts + 2)
+                    wait = min(60.0, rate_backoff * (2 ** (attempt - 1)))
+                else:
                     wait = backoff * (2 ** (attempt - 1))
+                self.log.log(f"  第 {attempt}/{limit} 次失败：{last_err}")
+                if attempt < limit:
                     self.log.log(f"  等待 {wait:.0f} 秒后重试…")
                     await asyncio.sleep(wait)
                 continue
 
+            kind = info.get("kind", "doc")
+            if kind == "mindmap":
+                self.mindmaps += 1
             self.manifest.record_ok(node_token, title, out, info["pages"],
-                                    info["chars"], self.sig)
+                                    info["chars"], self.sig,
+                                    kind=kind, images=info.get("images", 0))
             self.manifest.save()
             rel = self._rel(out)
             # PDF 保留原来的「N 页 / M 字」；docx/md 没有页数概念，直接用它自己的
@@ -415,9 +665,138 @@ class Exporter:
             tmp.unlink(missing_ok=True)
 
         info = inspect_output(out, self.ext, self.cfg["min_pdf_chars"], self._min_bytes())
+        info["kind"], info["images"] = "doc", 0
+
+        # Markdown 档特有：整篇是思维导图/画板的文档，飞书导出来就是个空壳
+        # （正文只剩一行标题）。**这不是「下坏了」**，重试多少次都一样，
+        # 得换条路走。PDF / Word 档不用管：它们本来就把导图当图片嵌在文件里。
+        if self.ext == "md" and self.mindmap:
+            blank, md_title = blank_md(out)
+            if blank:
+                info = await self._mindmap_retry(out, obj_token, md_title or title,
+                                                 src_type, info)
+
         if not info["ok"]:
             self._discard(out, zipped)
             raise RuntimeError(f"{self.ext_label} 校验未通过：{info['reason']}")
 
         self.log.log(f"  校验通过：{info['reason']}")
         return out, info
+
+    @staticmethod
+    def _result(out, ok, reason, kind="doc", images=0, chars=0):
+        """拼一个和 inspect_output 同形状的结果。"""
+        try:
+            size = Path(out).stat().st_size
+        except OSError:
+            size = 0
+        return {"ok": ok, "pages": 0, "chars": chars, "size": size,
+                "images": images, "reason": reason, "kind": kind}
+
+    async def _fetch_pdf(self, obj_token, src_type, dst):
+        """导一份 PDF 下来，返回 (图片总数, [(扩展名,字节),...], 内容流字节数)。"""
+        ticket = await self.api.export_create(obj_token, ext="pdf", src_type=src_type)
+        file_token = await self.api.wait_export(
+            ticket, obj_token, interval=self.cfg["poll_interval"],
+            timeout=self.cfg["export_timeout"], src_type=src_type,
+        )
+        await self.api.download(file_token, dst)
+        return await asyncio.to_thread(read_pdf_images, dst)
+
+    def _keep_pdf(self, keep, out, title, ink, note):
+        """把整份 PDF 留下，md 改成链接指向它。
+
+        抠不出「位图」**不等于**这篇是空的 —— 矢量画的画板就一个图片对象都没有，
+        可内容是实打实的。这时候唯一诚实的做法是把服务端渲染好的 PDF 原样留住。
+
+        代价是产物形态跟别处不一样（一个 `.md` 加一个 `.pdf`），
+        但那是「多一个文件」和「丢一篇内容」之间的选择 —— 选前者。
+        """
+        out = Path(out)
+        head = f"# {title}\n\n" if title else ""
+        try:
+            out.write_text(f"{head}[{title or out.stem}]({keep.name})\n",
+                           encoding="utf-8")
+        except OSError as e:
+            self.log.log(f"  ! 画板 PDF 已留下但 md 没写成：{e}")
+            return self._result(out, False, f"画板 PDF 的 md 没写成：{e}")
+        self.log.log(f"  {note}（内容流 {ink} 字节），整份 PDF 留成 {keep.name}")
+        fresh = inspect_output(out, self.ext, self.cfg["min_pdf_chars"],
+                               self._min_bytes())
+        return self._result(out, True, f"画板 → {keep.name}",
+                            kind="mindmap", images=0, chars=fresh["chars"])
+
+    async def _mindmap_retry(self, out, obj_token, title, src_type, info):
+        """空壳 Markdown 的兜底：改导 PDF，把里面那张导图抠出来。
+
+        产物形态：
+            <目录>/<同名>.jpg   抠出来的原图（**原样搬字节**，见 extract_pdf_images）
+            <目录>/<同名>.md    改写成引用它的 Markdown
+        抠不到位图时整份 PDF 留下，md 改成链接指向它。
+
+        md 为什么要改写：不改的话文件夹里躺着一个 10 字节的空壳 md，内容孤零零
+        在旁边，浏览时看不到、进笔记库也搜不到。改完 `# 标题` + 引用才是
+        「这份文档长这样」的诚实记录。
+
+        ⚠️ **没有位图时一律把 PDF 留下，不判「空文档」。** 这条是实测改出来的：
+
+        同一篇画板文档，连着导三次 PDF，一次给 30 KB（内容流 16 KB，里面有
+        194 段曲线、19 条描边 —— 真画了图），另两次只给 6 KB（内容流 860 字节，
+        就一个白底加标题）。**服务端的渲染会时好时坏。** 于是「没抠出图 + 内容流
+        很小 ⇒ 这篇是空的」这个推理是错的：它可能只是**这一版没渲染出来**。
+        早先按这个推理把「接口文档」记成「空文档」并放行了，实际丢了一张图。
+
+        所以现在：抠不到位图就多导几轮，留内容流最大的那版，并且一律把 PDF 留下
+        （多花的配额只落在画板这类文档上 —— 有真图的思维导图第一轮就收工了）。
+        误判成「多一个没用的 PDF」只是多占几 KB，误判成「空」是丢内容 ——
+        这边错得起，那边错不起。
+        """
+        self.log.log("  Markdown 正文只有标题（整篇是一张思维导图），改导 PDF 抠图…")
+        tmp = self.manifest.export_dir / f".tmp-{Path(out).stem}-mindmap.pdf"
+        keep = Path(out).parent / f"{Path(out).stem}.pdf"
+        images, best_ink = [], -1
+        try:
+            for round_no in range(_PDF_ROUNDS):
+                total, got, ink = await self._fetch_pdf(obj_token, src_type, tmp)
+                if total is None:
+                    self.log.log("  ! PDF 解析失败，保持原样交给上层重试。")
+                    return info
+                if got:
+                    images = got
+                    break
+                # 没位图：把这一版留着（每轮都比一下内容流，留最全的那版）
+                if ink > best_ink:
+                    best_ink = ink
+                    tmp.replace(keep)
+                if round_no + 1 < _PDF_ROUNDS:
+                    self.log.log(f"  这一版没抠到位图（内容流 {ink} 字节），"
+                                 f"再导一次 —— 只留内容最全的那版…")
+        except Exception as e:
+            self.log.log(f"  ! 思维导图兜底没成：{e}")
+            return info
+        finally:
+            # 留下的是 keep，tmp 每轮重新下载，这里删的永远是最后那份临时件
+            tmp.unlink(missing_ok=True)
+
+        if not images:
+            return self._keep_pdf(keep, out, title, best_ink, "没抠到位图")
+
+        if keep.exists():
+            keep.unlink()   # 有真图了，那份 PDF 就没必要留着
+        out = Path(out)
+        written = []
+        for i, (ext, data) in enumerate(images, 1):
+            name = f"{out.stem}.{ext}" if i == 1 else f"{out.stem}_{i}.{ext}"
+            (out.parent / name).write_bytes(data)
+            written.append(name)
+
+        head = f"# {title}\n\n" if title else ""
+        body = "\n".join(f"![{title or out.stem}]({n})" for n in written)
+        out.write_text(f"{head}{body}\n", encoding="utf-8")
+
+        self.log.log(f"  导图已抠出：{'、'.join(written)}")
+        fresh = inspect_output(out, self.ext, self.cfg["min_pdf_chars"],
+                               self._min_bytes())
+        return self._result(out, True, f"思维导图 → {'、'.join(written)}",
+                            kind="mindmap", images=len(written),
+                            chars=fresh["chars"])

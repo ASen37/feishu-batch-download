@@ -35,6 +35,17 @@ DEFAULTS = {
     # 下面两个是「格式自带的选项」，各管各的格式，另一个格式用不上就被忽略
     "export_comment": False,     # Word/PDF：带不带文档评论
     "export_attachment": True,   # Markdown：带附件的全部内容（False=仅正文）
+    # Markdown 档下，整篇就是一张思维导图/画板的文档会被飞书导成空壳
+    # （正文只有一行标题），这里打开就用「导 PDF 抠图」兜底。详见 exporter。
+    "mindmap_to_image": True,
+    # 两次接口请求起点的最小间隔（秒）。并发 4 个 worker 也绕不过它 ——
+    # 429 是**累计配额**打满，把请求铺开比靠 worker 各自重试有用得多。
+    "api_min_interval": 0.25,
+    # 撞 429 之后间隔最多拉到多少。撞一次翻倍，连续成功 20 次慢慢往回退。
+    "api_max_interval": 4.0,
+    # 429 单独一套退避基数（秒），比普通报错重得多：配额窗口是以分钟计的，
+    # 2 秒/4 秒这种退避等于没等。第 n 次重试等 retry_429_backoff × 2^(n-1)。
+    "retry_429_backoff": 8.0,
     "skip_existing": True,
     # 正文最少字数，低于此值判为空白页。默认 0（关闭）：
     # 换到官方导出后，服务端渲染的就是完整文档，「只渲染出视口那点内容」这种
@@ -66,9 +77,11 @@ _INT_KEYS = (
     "nav_timeout_ms",
     "api_timeout",
 )
-_FLOAT_KEYS = ("retry_backoff", "poll_interval")
+_FLOAT_KEYS = ("retry_backoff", "poll_interval", "api_min_interval",
+               "api_max_interval", "retry_429_backoff")
 _STR_KEYS = ("export_src_type", "browser", "browser_path", "export_dir")
-_BOOL_KEYS = ("skip_existing", "export_comment", "export_attachment")
+_BOOL_KEYS = ("skip_existing", "export_comment", "export_attachment",
+              "mindmap_to_image")
 
 # 格式名：用户写什么 → 内部统一叫什么。docx / markdown 当别名认，
 # 免得有人照着飞书的说法填了却悄悄退回 pdf。

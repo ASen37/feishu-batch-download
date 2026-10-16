@@ -77,7 +77,7 @@ def ask_url():
     last = last_url()
     print()
     print("=" * 52)
-    print("            飞书文档批量下载 PDF")
+    print("                飞书文档批量下载")
     print("=" * 52)
     print()
     print_tips()
