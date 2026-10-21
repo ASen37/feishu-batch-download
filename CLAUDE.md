@@ -49,7 +49,9 @@ Exporter.export ── 提交导出任务 → 轮询 → 下到临时文件 → 
 | `flybook/session.py` | 凭证的获取、缓存、刷新与**验收** |
 | `flybook/browser.py` | 浏览器会话，只用于登录与取凭证 |
 | `flybook/collector.py` | 文档树抓取（API 优先）+ 目录链计算 `build_paths` |
-| `flybook/exporter.py` | 单文档导出、产物校验、重试、zip 解压、思维导图转图片 |
+| `flybook/exporter.py` | 单文档导出、产物校验、重试、zip 解压、思维导图转 XMind / 图片 |
+| `flybook/xmind.py` | 画板节点树 → XMind（兼容内部接口与 lark-cli 两种格式） |
+| `wb2xmind.py` | 离线把一份画板 raw JSON 转成 XMind 的命令行入口 |
 | `flybook/throttle.py` | 全局请求节流（429 全体退让，成功若干次收回） |
 | `flybook/manifest.py` | 增量清单、文件名安全化、落点分配 |
 | `flybook/config.py` | 默认值、加载、类型校正 |
@@ -74,6 +76,16 @@ Exporter.export ── 提交导出任务 → 轮询 → 下到临时文件 → 
 - **两个错误码含义相反，别混**：`920004004 PermFail` = 身份不够格（该重登）；
   `920004002 SourceNotExist` = 节点不存在（该改链接，重登没用）。
   `session.verify` 对后者不重试，`session._diagnose` 按码给不同的下一步。
+- **知识库树里不只有文档**：上传的附件（`obj_type=12`）和电子表格（`obj_type=3`）
+  用 `type=docx` 提交导出都回 `[1014] export file token not found` —— 和「拿
+  wiki_token 当 obj_token」是同一个码，别误判成凭证问题。附件没有导出接口，
+  走云盘直链 `.../box/stream/download/all/<obj_token>/`；表格只认
+  `src_type=sheet` + `xlsx`（`pdf`/`csv`/`md` 回 `[1018] file extension mismatch`）。
+  `Exporter._export_nondoc` 靠 1014 触发补查，**不要改成每篇导出前都 get_node**
+  —— 那样等于白烧一整轮请求。
+- **附件/表格记录（`kind` 为 `file`/`sheet`）不适用 Markdown 的 wrap 规则，也不参与
+  `opts` 签名比对**：它们落的是原文件和固定 `.xlsx`，没有 `图片和附件/` 那一层。
+  照搬 wrap 会让 `is_current` 每次判「位置不对」，切格式时还会把它们全部重下一遍。
 - **`passback` 是 JSON 字符串**，且**仅在 Markdown 带附件时发送**（「仅文本」是
   不发这个键，不是发 `false`）。这些字段是抓包实测的，`export/create` 对任何字段名
   都回 `code=0`，改完没法靠返回码验证。
@@ -84,11 +96,33 @@ Exporter.export ── 提交导出任务 → 轮询 → 下到临时文件 → 
   加/改导出选项时必须同步它，否则老文件会被静默跳过。
 - **Markdown 导不出「整篇是一张思维导图/画板」的文档**：只给一个 10 字节的空壳
   （`# 总结\n\n`），且**不报错**。这不是下载失败，重试多少次都一样。
-  `exporter._mindmap_retry` 改导 PDF、把里面嵌的 JPEG 抠出来。
-  服务端**没有**导出成图片的接口（`png/jpg/svg` 一律 `[1018] file extension mismatch`），
-  界面上那个「下载为图片」是前端 canvas 画的，别去找接口。
+  现在的顺序是：先读画板节点转 XMind（`_xmind_retry`），转不了再导 PDF 抠 JPEG
+  （`_mindmap_retry` 后半段）。服务端**没有**导出成图片的接口
+  （`png/jpg/svg` 一律 `[1018] file extension mismatch`），界面上那个
+  「下载为图片」是前端 canvas 画的，别去找接口。
   判断空壳用 `blank_md`（剥掉 H1 后还剩不剩字），**不要拿体积判** —— 内容本来就少的
   文档（根文档「首页」467 字节）体积也很小。
+- **画板 token ≠ 文档 token**。一篇 docx 里可以嵌多个画板，要先用
+  `client_vars` 读块结构、取 `type=whiteboard` 的 `data.token`，再拿它问
+  `/space/api/whiteboard/block?blockToken=...`。拿 obj_token 直接问画板接口只会
+  返回 404 的 HTML 页面（`_request` 报「返回的不是 JSON」），看着像接口变了。
+- **画板节点有两种格式，字段完全不一样**：内部接口是 `nodes[].info.textV2.text` /
+  `info.mindMap.parentId`；lark-cli `--output_as raw` 是顶层 `text.text` /
+  `mind_map.parent_id`，图片节点父指针还在顶层 `parent_id`。`xmind.parse_nodes`
+  两种都认，加新字段时两边都要顾。
+- **画板图片多数是「形状填充图」，不在顶层 nodes 里**：真正的位置是父节点的
+  `children[]` → `info.fillV2.fillStyleList.data[].imageFillItem`，token 在
+  `resource.key`（`imageUrl` 里也能抠）。只找 `info.image` 会漏掉绝大多数截图，
+  用户看到的就是「导出的导图里图片全没了」。改了解析规则记得把
+  `exporter.XMIND_MARK` 加一版，否则清单会按旧版本号跳过、老文件永远不更新。
+- **画板里没有 `mindMap` 就不是思维导图**（自由画板、流程图、空目录页都是这样），
+  不能硬转成一张空 XMind，要抛给 PDF 兜底。多个根节点则合成一个虚拟根，
+  **别学原脚本只留最后一个根** —— 那样会静默丢内容。
+- **`manifest` 里 `kind=mindmap` 的老记录要能重导一次**：上一版只有「PDF 抠图」，
+  文件在、大小对，`is_done` 会一路放行，新加的 XMind 就永远不生效。
+  `_skip_ok` 里用「有 `xmind` 开关 + kind=mindmap + 没有 `xmind` 标记」把它们捞回来；
+  本轮查过确实没画板的会打 `xmind="none"`，下轮不再白查。临时失败**不打**
+  `none`，否则一次网络抖动会被永久记成结论。
 - **PDF 里那张导图会在每一页各挂一次同一个 XObject**，抠图必须按内容去重。
   抠到的是 DCTDecode 流，**原样写 `.jpg`，不要重编码**。
 - **绝不判「这篇是空文档」**：同一篇画板文档连导三次 PDF，内容流实测

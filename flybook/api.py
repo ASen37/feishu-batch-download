@@ -51,6 +51,13 @@ ERR_SOURCE_NOT_EXIST = 920004002
 # 让全体 worker 一起停（见 throttle），后者重试多少次都一样。
 ERR_RATE_LIMITED = 429
 
+# [1014] export file token not found。
+# 最常见的原因是拿 wiki_token 当 obj_token 用（见模块开头），但**不止这一种**：
+# 知识库里上传的附件（PDF/MD…）和电子表格也回这个码 —— 它们压根不走
+# docx 导出，重试多少次都一样。导出层见到它要先补查节点类型再决定怎么办
+# （见 exporter._export_nondoc），别一律当成凭证或 token 的问题。
+ERR_EXPORT_TOKEN_NOT_FOUND = 1014
+
 
 def is_rate_limited(exc):
     """这个异常是不是被限流了？导出器按它决定退避策略。"""
@@ -280,6 +287,66 @@ class FeishuApi:
         ]
         children.sort(key=sort_key_of)
         return (self_node if isinstance(self_node, dict) else {}), children
+
+    # ---------------- 画板 ----------------
+
+    async def whiteboard_tokens(self, obj_token):
+        """文档里有哪些画板？返回画板 token 列表（可能为空）。
+
+        「画板 token」不等于文档 token：一篇 docx 里可以嵌一个或多个画板，
+        每个画板块有自己的 token。网页版是先读文档块结构、再拿块上的 token
+        去读画板内容的，这里照同一条路走：
+
+            client_vars → block_map 里 type=whiteboard 的 data.token
+
+        ⚠️ 别拿 obj_token 直接去问画板接口 —— 那是文档 id，服务端只会给
+        404 页面（返回 HTML，被 _request 当成「不是 JSON」）。
+        """
+        url = (f"{self.host}/space/api/docx/pages/client_vars?"
+               + urllib.parse.urlencode({
+                   "id": obj_token, "mode": 7, "limit": 500,
+               }))
+        data = self._unwrap(await self._call(url), "查询文档块")
+        block_map = data.get("block_map")
+        if not isinstance(block_map, dict):
+            # 个别域名会多嵌一层 data
+            inner = data.get("data")
+            block_map = inner.get("block_map") if isinstance(inner, dict) else None
+        out = []
+        for block in (block_map or {}).values():
+            info = block.get("data") if isinstance(block, dict) else None
+            if (isinstance(info, dict) and info.get("type") == "whiteboard"
+                    and info.get("token")):
+                out.append(str(info["token"]))
+        # 去重：同一块理论上只出现一次，但别让上层为一个 token 建两张 sheet
+        return list(dict.fromkeys(out))
+
+    async def whiteboard_nodes(self, block_token):
+        """读一个画板的全部节点（原始结构，交给 flybook.xmind 归一化）。
+
+        返回 data.nodes（list）。节点字段：info.textV2.text（文字）、
+        info.mindMap.parentId（父节点）、info.baseV2（宽高）。这和 lark-cli
+        的开放平台原生格式**不一样**，exporter 那边两种都要认。
+
+        reqVersion / clientVersion 是网页版实测的取值，跟着前端走；接口
+        没有兼容性承诺，哪天失效了就改这一处（抓包看网页版发什么）。
+        """
+        url = (f"{self.host}/space/api/whiteboard/block?"
+               + urllib.parse.urlencode({
+                   "blockToken": block_token,
+                   "reqVersion": 1,
+                   "clientVersion": "13.3",
+               }))
+        data = self._unwrap(await self._call(url), "查询画板节点")
+        nodes = data.get("nodes")
+        if not isinstance(nodes, list):
+            # 同 client_vars，个别域名会多嵌一层 data
+            inner = data.get("data")
+            nodes = inner.get("nodes") if isinstance(inner, dict) else None
+        if not isinstance(nodes, list):
+            raise ApiError("画板响应里找不到 nodes",
+                           body=json.dumps(data, ensure_ascii=False)[:300])
+        return nodes
 
     # ---------------- 导出任务 ----------------
 

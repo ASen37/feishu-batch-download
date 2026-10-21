@@ -15,16 +15,19 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import shutil
 import stat
 import struct
+import tempfile
 import zipfile
 import zlib
 from pathlib import Path
 
-from .api import is_rate_limited
+from . import xmind
+from .api import ERR_EXPORT_TOKEN_NOT_FOUND, ApiError, is_rate_limited
 from .config import ext_of
 from .manifest import opts_sig
 
@@ -40,11 +43,59 @@ EXT_LABEL = {"pdf": "PDF", "docx": "Word", "md": "Markdown"}
 # 所以不能用任何门槛去判「这篇没内容」，只能多导几次挑最大的。
 _PDF_ROUNDS = 3
 
+# XMind 产物的规则版本。**改了节点解析方式（比如这次补上画板填充图）就要
+# 往上加一版**：清单里记着旧版本号的记录会被判为过期、重导一次，否则文件在、
+# 大小对，is_done 会一路放行，用户看到的还是缺图的老文件。
+XMIND_MARK = "v2"
+
 # 「字数少得可疑」的 Markdown 门槛，用来捞出清单里那批老的空壳记录。
 # 空壳实测是 10~12 字节（`# 总结\n\n`）；飞书给的标题本身就是几个字，
 # 所以数的是 md 里的字符数（`# 总结` 算 3 个字），门槛取 32 足够宽松 ——
 # 它只影响「要不要重查一次」，不会误判产物好坏，宽一点无所谓。
 SUSPECT_MD_CHARS = 32
+
+# 飞书节点的 obj_type。**知识库里不只有文档**：上传的附件和电子表格也在树里，
+# 而且它们用 docx 提交导出时一律回 [1014] export file token not found，
+# 跟「拿 wiki_token 当 obj_token 用」是同一个码，很容易误判成凭证问题：
+#   12 = 用户上传的文件（PDF / MD / DOCX…）：没有导出接口，只能走云盘直链下载；
+#    3 = 电子表格：能导出，但**只认 xlsx**（pdf / csv / md 都回
+#        [1018] export file extension  mismatch，实测）。
+OBJ_TYPE_SHEET = 3
+OBJ_TYPE_FILE = 12
+
+# 不走导出、直接落盘/按原格式落盘的 kind（影响跳过判断里 wrap 的取值，见 _skip_ok）
+NATIVE_KINDS = ("file", "sheet")
+
+
+def _file_ext_of(node, title):
+    """上传文件该用什么扩展名：优先 icon_info.file_type，再退到标题后缀。
+
+    icon_info 是**字符串形式的 JSON**（接口原样返回），里面 file_type 实测
+    就是 `pdf` / `md` 这种不带点的扩展名。
+    """
+    info = node.get("icon_info")
+    if isinstance(info, str):
+        try:
+            info = json.loads(info)
+        except ValueError:
+            info = {}
+    ext = str((info or {}).get("file_type") or "").strip().lower()
+    if not ext:
+        ext = Path(title or "").suffix.lstrip(".").lower()
+    return ext
+
+
+def _drop_ext(title, ext):
+    """标题本身已带扩展名时先剥掉，别让 allocate_path 再拼一次。
+
+    上传的附件标题就长这样：`整合华为云IOT的方案.md`。不剥的话，
+    safe_name 会把点换成下划线，最后落成 `整合华为云IOT的方案_md.md`。
+    """
+    suffix = f".{ext}" if ext else ""
+    if suffix and title.lower().endswith(suffix):
+        return title[: -len(suffix)]
+    return title
+
 
 try:
     from pypdf import PdfReader
@@ -490,25 +541,47 @@ class Exporter:
         # 没有附件的文档因此会多包一层只装一个 .md 的文件夹 —— 换来的是
         # 落点可预测、跳过判断可靠，这个交换划算。
         self.wrap = self.ext == "md" and self.attachment
-        # 思维导图/画板文档的兜底开关，只对 Markdown 档有意义（见 _mindmap_retry）
+        # 思维导图/画板文档的兜底开关，只对 Markdown 档有意义（见 _mindmap_retry）。
+        # xmind 是首选（结构完整、可编辑），image 是它的退路。
+        self.xmind = bool(cfg.get("mindmap_to_xmind", True))
         self.mindmap = bool(cfg.get("mindmap_to_image", True))
         # 本次运行走了兜底的篇数，汇总时报给主人。worker 都在同一个事件循环里
         # 跑，自增之间没有 await，不会丢计数。
+        self.xminds = 0
         self.mindmaps = 0
 
     def _skip_ok(self, node_token, title, parents):
         """这篇能不能直接跳过？"""
+        rec = self.manifest.get(node_token) or {}
+        # 上传的文件和电子表格是原样落盘的，**没有** `图片和附件/` 那一层，
+        # 所以 Markdown 带附件时的 wrap 规则对它们不适用。照搬的话
+        # is_current 会要求多一层同名文件夹，每次都判「位置不对」→ 永远重下。
+        native = rec.get("kind") in NATIVE_KINDS
+        wrap = self.wrap and not native
+        # 附件原文件和表格导出的 xlsx 都跟本次选的导出格式无关：上传的 PDF
+        # 不会因为切到 Word 档就变成另一个文件。所以这两类记录不参与
+        # opts 签名比对，否则每换一次格式都要把附件重下一遍。
+        sig = (rec.get("opts") or self.sig) if native else self.sig
         if not (self.manifest.is_done(node_token, self.cfg.get("skip_existing", True))
                 and self.manifest.is_current(
-                    node_token, parents, self.sig, self.cfg["max_filename_len"],
-                    wrap=self.wrap, title=title)):
+                    node_token, parents, sig, self.cfg["max_filename_len"],
+                    wrap=wrap, title=title)):
+            return False
+        # 上一版只有「导 PDF 抠图」这条兜底，清单里记的是 kind=mindmap 且没有
+        # xmind 标记。现在能转 XMind 了，让它们重导一次 —— 否则文件在、大小对，
+        # is_done 会一路放行，新功能对这些文档永远不生效。
+        # 本轮如果查过发现确实没有画板，会打上 xmind="none"，下轮就不再重查。
+        if self.xmind and rec.get("kind") == "mindmap" and not rec.get("xmind"):
+            return False
+        # 规则版本旧了也要重导（例如 v1 漏掉了画板里的填充图）。
+        if (self.xmind and rec.get("kind") == "xmind"
+                and rec.get("xmind") != XMIND_MARK):
             return False
         # Markdown 档还要多看一眼：清单里存着一批**空壳 md 被记成 ok** 的老记录
         # （加导图兜底之前导的，正文只有一行标题）。它们文件在、大小也对，
         # is_done 会一路放行，结果是「修好了也永远不重导」。
         # 只挑「字数少得可疑、又没打 kind 标记」的重查一次，别的 md 记录不受影响。
         if self.ext == "md":
-            rec = self.manifest.get(node_token) or {}
             if not rec.get("kind") and (rec.get("chars") or 0) < SUSPECT_MD_CHARS:
                 return False
             # 「空文档」那条结论已经删掉了 —— 它是错的（画板渲染时好时坏，
@@ -553,6 +626,14 @@ class Exporter:
                 out, info = await self._once(obj_token, node_token, title, parents)
             except Exception as e:
                 last_err = str(e)
+                # 1014 不一定是 token 的问题：上传的附件和电子表格用 docx 提交
+                # 也是这个码。补查节点类型，能走旁路就走旁路；否则再按原逻辑重试。
+                if (isinstance(e, ApiError)
+                        and e.code == ERR_EXPORT_TOKEN_NOT_FOUND and obj_token):
+                    alt = await self._export_nondoc(node_token, obj_token,
+                                                    title, parents)
+                    if alt is not None:
+                        return alt
                 if is_rate_limited(e):
                     # 429 不是这篇的问题，多给几次机会
                     limit = max(limit, attempts + 2)
@@ -566,11 +647,14 @@ class Exporter:
                 continue
 
             kind = info.get("kind", "doc")
-            if kind == "mindmap":
+            if kind == "xmind":
+                self.xminds += 1
+            elif kind == "mindmap":
                 self.mindmaps += 1
             self.manifest.record_ok(node_token, title, out, info["pages"],
                                     info["chars"], self.sig,
-                                    kind=kind, images=info.get("images", 0))
+                                    kind=kind, images=info.get("images", 0),
+                                    xmind=info.get("xmind", ""))
             self.manifest.save()
             rel = self._rel(out)
             # PDF 保留原来的「N 页 / M 字」；docx/md 没有页数概念，直接用它自己的
@@ -585,6 +669,92 @@ class Exporter:
         self.manifest.record_fail(node_token, title, last_err)
         self.manifest.save()
         return "fail", last_err
+
+    async def _export_nondoc(self, node_token, obj_token, title, parents):
+        """1014 时补查节点类型：附件直链下载、表格按 xlsx 导出。
+
+        返回 (status, detail)；节点确实是普通文档（或查类型本身失败）时返回
+        None，交还上层按原来的重试逻辑处理。
+
+        为什么靠错误码触发、不提前给每篇都查：50 篇里通常只有零星几篇是附件
+        或表格，全员先查一遍等于白加 50 次请求。失败一次再查，代价只落在
+        真正有问题的那几篇上。
+        """
+        try:
+            node = await self.api.get_node(node_token)
+        except ApiError:
+            # 补查本身失败（网络 / 限流）—— 别把这类错误当成「节点不支持」，
+            # 交给外层的退避重试。
+            return None
+        obj_type = node.get("obj_type")
+        if obj_type == OBJ_TYPE_FILE:
+            return await self._export_file(node_token, obj_token, title, parents, node)
+        if obj_type == OBJ_TYPE_SHEET:
+            return await self._export_sheet(node_token, obj_token, title, parents)
+        # 不是这两种还回 1014：要么真是 token 不对，要么是没见过的类型。
+        # 让它继续走原来的重试，最后一轮把原始错误报出来。
+        return None
+
+    async def _export_file(self, node_token, obj_token, title, parents, node):
+        """上传的文件：云盘里本来就有原文件，直链下下来，原样落盘。"""
+        ext = _file_ext_of(node, title)
+        if not ext:
+            raise RuntimeError("这是上传的文件，但查不到扩展名，没法决定落盘名字")
+        stem = _drop_ext(title, ext)
+        out = self.manifest.allocate_path(
+            stem, node_token, self.cfg["max_filename_len"], parents, ext,
+            wrap=False,  # 原文件没有 `图片和附件/`，不需要折一层文件夹
+        )
+        self.log.log(f"  标题：{stem} → {self._rel(out)}（上传的原文件，直链下载）")
+
+        tmp = self.manifest.export_dir / f".tmp-{node_token}.{ext}"
+        try:
+            size = await self.api.download(obj_token, tmp)
+            if size <= 0:
+                raise RuntimeError("直链下载回来是空文件")
+            tmp.replace(out)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        self.manifest.record_ok(node_token, title, out, 0, 0, self.sig,
+                                kind="file", images=0)
+        self.manifest.save()
+        return "ok", f"{self._rel(out)}（上传的原文件，{size} 字节）"
+
+    async def _export_sheet(self, node_token, obj_token, title, parents):
+        """电子表格：只认 xlsx（pdf / csv / md 都被服务端以 1018 拒掉）。"""
+        ext = "xlsx"
+        out = self.manifest.allocate_path(
+            title, node_token, self.cfg["max_filename_len"], parents, ext,
+            wrap=False,
+        )
+        self.log.log(f"  标题：{title} → {self._rel(out)}（电子表格，导出为 xlsx）")
+
+        ticket = await self.api.export_create(obj_token, ext=ext, src_type="sheet")
+        self.log.log(f"  导出任务已提交（ticket={ticket}），等待服务端渲染…")
+        file_token = await self.api.wait_export(
+            ticket, obj_token,
+            interval=self.cfg["poll_interval"],
+            timeout=self.cfg["export_timeout"],
+            src_type="sheet",
+        )
+
+        # xlsx 本身也是 zip（PK 开头），**不能**走 _once 里那套「按文件头判断
+        # 要不要解压」的逻辑 —— 那是给 Markdown 附件包用的，解 xlsx 只会得到
+        # 一堆 xl/、docProps/ 目录。
+        tmp = self.manifest.export_dir / f".tmp-{node_token}.{ext}"
+        try:
+            size = await self.api.download(file_token, tmp)
+            if size <= 0:
+                raise RuntimeError("xlsx 下载回来是空文件")
+            tmp.replace(out)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        self.manifest.record_ok(node_token, title, out, 0, 0, self.sig,
+                                kind="sheet", images=0)
+        self.manifest.save()
+        return "ok", f"{self._rel(out)}（电子表格，{size} 字节）"
 
     def _rel(self, path):
         """相对导出目录的路径，日志里看着比绝对路径清爽。"""
@@ -670,7 +840,7 @@ class Exporter:
         # Markdown 档特有：整篇是思维导图/画板的文档，飞书导出来就是个空壳
         # （正文只剩一行标题）。**这不是「下坏了」**，重试多少次都一样，
         # 得换条路走。PDF / Word 档不用管：它们本来就把导图当图片嵌在文件里。
-        if self.ext == "md" and self.mindmap:
+        if self.ext == "md" and (self.xmind or self.mindmap):
             blank, md_title = blank_md(out)
             if blank:
                 info = await self._mindmap_retry(out, obj_token, md_title or title,
@@ -726,6 +896,119 @@ class Exporter:
         return self._result(out, True, f"画板 → {keep.name}",
                             kind="mindmap", images=0, chars=fresh["chars"])
 
+    async def _xmind_images(self, nodes, extras):
+        """把画板里用到的图片下下来，返回 {token: {"data": 字节}}。
+
+        图片是**锦上添花**：下不下来都不影响文字结构，所以这里逐张 try，
+        失败只记一行日志。临时目录用完即删，不往导出目录里撒碎文件。
+        """
+        tokens = [i["token"] for n in nodes for i in (n.get("images") or [])]
+        for items in (extras or {}).values():
+            tokens.extend(i["token"] for i in items)
+        if not tokens:
+            return {}
+
+        out = {}
+        with tempfile.TemporaryDirectory(prefix="flybook-xmind-") as tmp:
+            for token in dict.fromkeys(tokens):
+                dst = Path(tmp) / token
+                try:
+                    size = await self.api.download(token, dst)
+                except Exception as e:
+                    self.log.log(f"  （画板图片 {token} 下载失败，已跳过："
+                                 f"{str(e)[:80]}）")
+                    continue
+                if size <= 0:
+                    continue
+                raw = dst.read_bytes()
+                # 下载域对不认识的 token 可能回一个 200 的 HTML 错误页，
+                # 不验文件头就会把它当 PNG 塞进 XMind，图片位置显示成一片空白。
+                if not xmind.is_image(raw):
+                    self.log.log(f"  （画板图片 {token} 不是图片格式，已跳过）")
+                    continue
+                out[token] = {"data": raw}
+        return out
+
+    async def _xmind_retry(self, out, obj_token, title, info):
+        """把画板节点转成 XMind，写在 Markdown 旁边。返回结果或 None。
+
+        这一步是「导 PDF 抠图」的**首选替代**：同样是从空壳 md 触发，但拿到的
+        是一棵可编辑的树，而不是一张位图。转不了（文档里没有画板、画板不是
+        思维导图、接口出错）就返回 None，原样交给 PDF 兜底 —— 多这一层绝不
+        应该让原本能导的文档导不出来。
+
+        `info["xmind"]` 的两种取值要分清：
+          - "none"：确认过没有可转的画板。记进清单，下轮不再白查一遍；
+          - 不设  ：查询/转换过程出错（网络、限流、接口变了），下轮还要再试。
+            这里之所以不写 "none"，是因为一次临时失败不该被永久记成结论。
+        """
+        try:
+            tokens = await self.api.whiteboard_tokens(obj_token)
+        except Exception as e:
+            self.log.log(f"  ! 查询文档画板失败：{str(e)[:100]}")
+            return None
+        if not tokens:
+            self.log.log("  文档里没有画板块，改走 PDF 抠图。")
+            info["xmind"] = "none"
+            return None
+
+        sheets, node_total, image_total = [], 0, 0
+        broken = False  # 有没有画板是「没读到」，别把临时故障当成「没有画板」
+        for i, token in enumerate(tokens, 1):
+            try:
+                raw = await self.api.whiteboard_nodes(token)
+            except Exception as e:
+                self.log.log(f"  ! 读取画板 {token} 失败：{str(e)[:100]}")
+                broken = True
+                continue
+            nodes, extras = xmind.parse_nodes(raw)
+            try:
+                # 图片先下好，make_sheet 是纯函数、不碰 IO
+                images = await self._xmind_images(nodes, extras)
+                sheet_title = title if len(tokens) == 1 else f"{title} - 画板{i}"
+                sheet, stats = xmind.make_sheet(nodes, sheet_title, extras, images)
+            except ValueError as e:
+                self.log.log(f"  画板 {token} 未转换：{e}")
+                continue
+            sheets.append(sheet)
+            node_total += stats["nodes"]
+            image_total += stats["images"]
+
+        if not sheets:
+            # 全部画板都读成功、只是没有思维导图结构 → 这是确定的结论；
+            # 有画板没读到 → 可能是网络/限流，不落盘，下轮再试。
+            if not broken:
+                info["xmind"] = "none"
+            return None
+
+        out = Path(out)
+        xout = out.with_suffix(".xmind")
+        try:
+            # 先写 xmind 再改 md：md 是清单里的「正身」，它一改就代表这篇成了。
+            # 反过来的话，写 xmind 失败会留下一个指向不存在文件的 md。
+            xmind.write_xmind(sheets, xout)
+            head = f"# {title}\n\n" if title else ""
+            out.write_text(
+                f"{head}[{title or out.stem}]({xout.name})\n", encoding="utf-8"
+            )
+        except Exception as e:
+            self.log.log(f"  ! 写 XMind 失败：{str(e)[:100]}")
+            try:
+                xout.unlink()
+            except OSError:
+                pass
+            return None
+
+        imgs = f" / {image_total} 张图" if image_total else ""
+        self.log.log(f"  已转成 XMind：{xout.name}"
+                     f"（{len(sheets)} 张画板 / {node_total} 个节点{imgs}）")
+        fresh = inspect_output(out, self.ext, self.cfg["min_pdf_chars"],
+                               self._min_bytes())
+        res = self._result(out, True, f"思维导图 → {xout.name}", kind="xmind",
+                           images=image_total, chars=fresh["chars"])
+        res["xmind"] = XMIND_MARK
+        return res
+
     async def _mindmap_retry(self, out, obj_token, title, src_type, info):
         """空壳 Markdown 的兜底：改导 PDF，把里面那张导图抠出来。
 
@@ -751,7 +1034,16 @@ class Exporter:
         误判成「多一个没用的 PDF」只是多占几 KB，误判成「空」是丢内容 ——
         这边错得起，那边错不起。
         """
-        self.log.log("  Markdown 正文只有标题（整篇是一张思维导图），改导 PDF 抠图…")
+        self.log.log("  Markdown 正文只有标题（整篇是一张思维导图）。")
+        # 首选 XMind：结构完整、能编辑。失败/不适用再走下面的 PDF 抠图。
+        if self.xmind:
+            self.log.log("  先试转 XMind…")
+            got = await self._xmind_retry(out, obj_token, title, info)
+            if got is not None:
+                return got
+        if not self.mindmap:
+            return info
+        self.log.log("  改导 PDF 抠图…")
         tmp = self.manifest.export_dir / f".tmp-{Path(out).stem}-mindmap.pdf"
         keep = Path(out).parent / f"{Path(out).stem}.pdf"
         images, best_ink = [], -1
@@ -779,7 +1071,11 @@ class Exporter:
             tmp.unlink(missing_ok=True)
 
         if not images:
-            return self._keep_pdf(keep, out, title, best_ink, "没抠到位图")
+            res = self._keep_pdf(keep, out, title, best_ink, "没抠到位图")
+            # 把「查过、确实没有可转画板」这个结论带到清单里，
+            # 否则下一轮还会为同一篇文档再查一次
+            res["xmind"] = info.get("xmind", "")
+            return res
 
         if keep.exists():
             keep.unlink()   # 有真图了，那份 PDF 就没必要留着
@@ -797,6 +1093,8 @@ class Exporter:
         self.log.log(f"  导图已抠出：{'、'.join(written)}")
         fresh = inspect_output(out, self.ext, self.cfg["min_pdf_chars"],
                                self._min_bytes())
-        return self._result(out, True, f"思维导图 → {'、'.join(written)}",
-                            kind="mindmap", images=len(written),
-                            chars=fresh["chars"])
+        res = self._result(out, True, f"思维导图 → {'、'.join(written)}",
+                           kind="mindmap", images=len(written),
+                           chars=fresh["chars"])
+        res["xmind"] = info.get("xmind", "")
+        return res

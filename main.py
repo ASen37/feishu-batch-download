@@ -280,9 +280,12 @@ async def run(cfg, args, logger):
 
     logger.log("===== 汇总 =====")
     logger.log(f"成功 {stats['ok']} 个,跳过 {stats['skip']} 个,失败 {stats['fail']} 个。")
+    if exporter.xminds:
+        logger.log(f"其中思维导图转 XMind {exporter.xminds} 篇"
+                   f"（Markdown 导不出画板内容，已把画板节点转成可编辑的 .xmind）。")
     if exporter.mindmaps:
         logger.log(f"其中思维导图转图片 {exporter.mindmaps} 篇"
-                   f"（Markdown 导不出画板内容，改导 PDF 抠的图）。")
+                   f"（画板没有可转的节点结构，改导 PDF 抠的图）。")
     if throttle.penalties:
         # 只在真被限流过时才提，正常跑不该刷这一行
         logger.log(f"接口限流：{throttle.describe()}，"
