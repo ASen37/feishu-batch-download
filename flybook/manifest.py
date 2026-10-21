@@ -270,18 +270,25 @@ class Manifest:
             return Path(path).name
 
     def record_ok(self, token, title, path, pages, chars, opts="", kind="doc",
-                  images=0):
+                  images=0, xmind=""):
         """记一条成功。
 
         kind 说明这份产物是**怎么来的**：
           - `doc`     ：飞书导出的正文（PDF / Word / Markdown 原样）
+          - `xmind`   ：整篇是画板，已把画板节点转成 XMind（结构完整）
           - `mindmap` ：整篇就是一张思维导图，正文导出来是空壳，
                         改走「导 PDF 抠图」兜底（见 exporter），
                         images 记抠到几张
+          - `file`    ：知识库里上传的附件，直链下载的原文件（原始扩展名）
+          - `sheet`   ：电子表格，服务端导出的 xlsx（唯一可用格式）
 
         为什么要记：老清单里有一批空壳 md 被记成了 ok（那时还没兜底），
         `is_done` 会把它们一路放行，于是修好了也永远不重导。有了 kind，
         才有一根「这篇是按新规则导的」的凭据。
+
+        xmind 只在 kind=mindmap 时有意义：`none` 表示查过、文档里确实没有
+        可转的画板，以后别再每轮重查；空字符串表示还没走过这条路（老记录
+        或查询失败），新版本会重导一次。
         """
         path = Path(path)
         try:
@@ -302,6 +309,8 @@ class Manifest:
             "exported_at": now_str(),
             "status": "ok",
         }
+        if xmind:
+            self.docs[token]["xmind"] = xmind
 
     def record_fail(self, token, title, error):
         prev = self.docs.get(token) or {}

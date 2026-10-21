@@ -36,7 +36,10 @@ DEFAULTS = {
     "export_comment": False,     # Word/PDF：带不带文档评论
     "export_attachment": True,   # Markdown：带附件的全部内容（False=仅正文）
     # Markdown 档下，整篇就是一张思维导图/画板的文档会被飞书导成空壳
-    # （正文只有一行标题），这里打开就用「导 PDF 抠图」兜底。详见 exporter。
+    # （正文只有一行标题）。打开后先试着把画板节点转成 XMind（结构完整、
+    # 可编辑），转不了再退回「导 PDF 抠图」。详见 exporter 与 flybook/xmind.py。
+    "mindmap_to_xmind": True,
+    # 上一条失败时的兜底：导 PDF、把内嵌的那张位图抠出来
     "mindmap_to_image": True,
     # 两次接口请求起点的最小间隔（秒）。并发 4 个 worker 也绕不过它 ——
     # 429 是**累计配额**打满，把请求铺开比靠 worker 各自重试有用得多。
@@ -81,7 +84,7 @@ _FLOAT_KEYS = ("retry_backoff", "poll_interval", "api_min_interval",
                "api_max_interval", "retry_429_backoff")
 _STR_KEYS = ("export_src_type", "browser", "browser_path", "export_dir")
 _BOOL_KEYS = ("skip_existing", "export_comment", "export_attachment",
-              "mindmap_to_image")
+              "mindmap_to_xmind", "mindmap_to_image")
 
 # 格式名：用户写什么 → 内部统一叫什么。docx / markdown 当别名认，
 # 免得有人照着飞书的说法填了却悄悄退回 pdf。

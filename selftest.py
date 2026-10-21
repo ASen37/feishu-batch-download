@@ -912,6 +912,151 @@ with tempfile.TemporaryDirectory() as tmp:
     check("解析不了时报 None，绝不冒充「这篇是空文档」", total is None, str(total))
     check("解析不了时内容流按 0 报", ink == 0, str(ink))
 
+print("== 21. 画板节点转 XMind（内部接口格式 + lark-cli 格式都要认） ==")
+import json as _json  # noqa: E402
+import zipfile as _zipfile  # noqa: E402
+
+from flybook import xmind as X  # noqa: E402
+
+# 实测取自 /space/api/whiteboard/block：节点在 info 下面，父指针叫 mindMap.parentId。
+# 图片节点有 token、没文字，要挂到父节点上，不能建成一个「(无标题)」topic。
+INTERNAL_WB = {
+    "code": 0,
+    "data": {
+        "nodes": [
+            {"id": "r", "info": {
+                "textV2": {"text": "根节点"},
+                "mindMap": {"parentId": ""},
+                "baseV2": {"width": 300, "height": 100}}},
+            {"id": "c1", "info": {
+                "textV2": {"text": "子节点一"},
+                "mindMap": {"parentId": "r"}}},
+            # 实测形态：图片不是独立节点，而是复合子节点的**形状填充图**。
+            # 只看 info.image 会把这种图全漏掉（用户反馈「图片都没了」就是这个）。
+            {"id": "c2", "info": {
+                "textV2": {"text": "子节点二"},
+                "mindMap": {"parentId": "r"}},
+             "children": [
+                 {"id": "d1", "info": {
+                     "baseV2": {"width": 500, "height": 322},
+                     "fillV2": {"fillStyleList": {"data": [
+                         {"imageFillItem": {
+                             "imageUrl": "https://internal-api-drive-stream.feishu.cn"
+                                          "/space/api/box/stream/download/preview/"
+                                          "tk-fill?preview_type=16",
+                             "resource": {"key": "tk-fill", "type": 1}}}]}}}},
+                 {"id": "d2", "info": {
+                     "fillV2": {"fillStyleList": {"data": [
+                         {"imageFillItem": {"resource": {"key": "tk-fill2"}}}]}}}},
+             ]},
+            {"id": "img", "info": {
+                "image": {"token": "tk-img"},
+                "mindMap": {"parentId": "c1"},
+                "baseV2": {"width": 10, "height": 10}}},
+        ]
+    },
+}
+
+nodes, extras = X.parse_nodes(INTERNAL_WB)
+check("内部格式：3 个文字节点 + 1 个图片节点",
+      len(nodes) == 3 and len(extras.get("c1", [])) == 1)
+check("内部格式：图片挂到父节点，不单独建 topic",
+      extras.get("c1", [{}])[0].get("token") == "tk-img", repr(extras))
+check("内部格式：父指针取自 mindMap.parentId",
+      {n["id"]: n["parent_id"] for n in nodes} == {"r": "", "c1": "r", "c2": "r"})
+_by = {n["id"]: n for n in nodes}
+check("内部格式：复合子节点里的填充图要捞出来（resource.key 与 imageUrl 两种写法）",
+      [i["token"] for i in _by["c2"]["images"]] == ["tk-fill", "tk-fill2"],
+      str([i["token"] for i in _by["c2"]["images"]]))
+
+# lark-cli whiteboard +query --output_as raw 的原生格式：字段在顶层
+OPENAPI_WB = [
+    {"id": "a", "type": "mind_node_text", "text": {"text": "A"},
+     "mind_map": {"parent_id": ""}, "width": 80, "height": 40},
+    {"id": "b", "type": "mind_node_text", "text": {"text": "B"},
+     "mind_map": {"parent_id": "a"}},
+    {"id": "pic", "type": "image", "parent_id": "b",
+     "image": {"token": "tk2"}, "width": 20, "height": 30},
+]
+nodes2, extras2 = X.parse_nodes(OPENAPI_WB)
+check("lark-cli 格式：两种格式解析结果一致（文字/父指针）",
+      [(n["id"], n["text"], n["parent_id"]) for n in nodes2]
+      == [("a", "A", ""), ("b", "B", "a")])
+check("lark-cli 格式：image 节点的 token 挂到父节点",
+      extras2.get("b", [{}])[0].get("token") == "tk2", repr(extras2))
+
+sheet, stats = X.make_sheet(nodes, "总结", extras)
+check("建树：根节点标题", sheet["rootTopic"]["title"] == "根节点")
+kids = sheet["rootTopic"].get("children", {}).get("attached", [])
+check("建树：两个子节点保序", [k["title"] for k in kids] == ["子节点一", "子节点二"])
+check("建树：统计节点数", stats["nodes"] == 3 and stats["roots"] == 1, str(stats))
+
+# 多个根：合成虚拟根，不能像原脚本那样只留最后一个、静默丢内容
+multi = [
+    {"id": "x", "text": "X", "parent_id": "", "mind": True},
+    {"id": "y", "text": "Y", "parent_id": "", "mind": True},
+]
+sheet3, stats3 = X.make_sheet(multi, "多根画板")
+check("多根：合成一个虚拟根", sheet3["rootTopic"]["title"] == "多根画板")
+check("多根：两棵树都留下",
+      len(sheet3["rootTopic"]["children"]["attached"]) == 2 and stats3["roots"] == 2)
+
+# 自由画板（没有 mindMap 结构）不能硬转成空导图 —— 必须让调用方走 PDF 兜底
+free, _ = X.parse_nodes([{"id": "n", "info": {"textV2": {"text": "自由画板"}}}])
+try:
+    X.make_sheet(free, "自由画板")
+    check("非思维导图结构的画板要拒绝", False)
+except ValueError:
+    check("非思维导图结构的画板要拒绝", True)
+try:
+    X.make_sheet([], "空")
+    check("空节点要拒绝", False)
+except ValueError:
+    check("空节点要拒绝", True)
+
+with tempfile.TemporaryDirectory() as tmp:
+    out = Path(tmp) / "总结.xmind"
+    st = X.convert(INTERNAL_WB, out, "总结",
+                   images={"tk-img": {"data": b"\x89PNG\r\n\x1a\nfake",
+                                       "mime": "image/png"},
+                           "tk-fill": {"data": b"\x89PNG\r\n\x1a\nfill",
+                                        "mime": "image/png"},
+                           "tk-fill2": {"data": b"\x89PNG\r\n\x1a\nfill2",
+                                         "mime": "image/png"}})
+    with _zipfile.ZipFile(out) as z:
+        names = set(z.namelist())
+        content = _json.loads(z.read("content.json"))
+        meta = _json.loads(z.read("metadata.json"))
+        manifest = _json.loads(z.read("manifest.json"))
+    check("XMind 就是个装三份 JSON 的 zip",
+          names == {"content.json", "metadata.json", "manifest.json"}, str(names))
+    check("sheet 标题与根 topic 正确",
+          content[0]["title"] == "总结"
+          and content[0]["rootTopic"]["title"] == "根节点")
+    child = content[0]["rootTopic"]["children"]["attached"][0]
+    check("图片按 data URI 内嵌到所属节点",
+          child.get("image", {}).get("src", "").startswith("data:image/png;base64,"))
+    child2 = content[0]["rootTopic"]["children"]["attached"][1]
+    check("填充图也内嵌到文字节点上",
+          child2.get("image", {}).get("src", "").startswith("data:image/png;base64,"))
+    check("同一节点多张图：其余图做成「(图片)」子节点，不能丢",
+          any(k.get("title") == "(图片)" and k.get("image")
+              for k in child2.get("children", {}).get("attached", [])))
+    check("metadata 标明 dataStructureVersion=2",
+          meta.get("dataStructureVersion") == "2")
+    check("manifest 收录两份 JSON",
+          set(manifest.get("file-entries", {})) == {"content.json", "metadata.json"})
+    check("转换统计包含嵌入的图片数", st["images"] == 3 and st["nodes"] == 3, str(st))
+
+    # 多张画板 → 多张 sheet，一个文件
+    other, _st = X.make_sheet(nodes2, "第二张")
+    multi_out = Path(tmp) / "多画板.xmind"
+    X.write_xmind([sheet, other], multi_out)
+    with _zipfile.ZipFile(multi_out) as z:
+        content2 = _json.loads(z.read("content.json"))
+    check("多张画板合成一个多 sheet 文件", len(content2) == 2
+          and [s["title"] for s in content2] == ["总结", "第二张"])
+
 print()
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项。")
 for n in FAIL:
